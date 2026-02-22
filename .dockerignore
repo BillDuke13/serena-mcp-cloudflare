@@ -1,0 +1,45 @@
+# Exclude files not needed inside the production container image
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+.venv/
+
+# Node.js artifacts (not needed in Python container)
+node_modules/
+pnpm-lock.yaml
+package.json
+cloudflare/
+!cloudflare/bin/
+!cloudflare/bin/start-serena-mcp.sh
+
+# Test data (can be large)
+test/
+
+# Development tooling
+.serena/
+docs/
+scripts/
+resources/
+flake.nix
+flake.lock
+
+# Git
+.git/
+.gitignore
+
+# IDE / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# CI
+.github/

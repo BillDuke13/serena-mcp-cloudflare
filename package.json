@@ -1,0 +1,35 @@
+{
+  "name": "serena-mcp-cloudflare",
+  "version": "0.1.0",
+  "description": "Cloudflare Workers + Containers deployment for Serena MCP remote server",
+  "private": false,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/BillDuke13/serena-mcp-cloudflare.git"
+  },
+  "homepage": "https://github.com/BillDuke13/serena-mcp-cloudflare",
+  "bugs": {
+    "url": "https://github.com/BillDuke13/serena-mcp-cloudflare/issues"
+  },
+  "scripts": {
+    "deploy": "wrangler deploy",
+    "dev": "wrangler dev",
+    "secret:token": "wrangler secret put API_TOKEN",
+    "containers:list": "wrangler containers list",
+    "containers:images": "wrangler containers images list",
+    "typecheck": "tsc --noEmit -p cloudflare/tsconfig.json"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild",
+      "workerd"
+    ]
+  },
+  "devDependencies": {
+    "@cloudflare/containers": "^0.1.0",
+    "@cloudflare/workers-types": "^4.20250620.0",
+    "typescript": "^5.8.3",
+    "wrangler": "^4.20.0"
+  }
+}

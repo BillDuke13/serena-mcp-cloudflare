@@ -1,0 +1,118 @@
+# Production Docker image for Cloudflare Containers deployment
+# Runs Serena MCP server with streamable-http transport on port 8080
+#
+# Build context: project root
+# Architecture: linux/amd64 (Cloudflare Containers requirement)
+FROM --platform=linux/amd64 python:3.11-slim
+
+SHELL ["/bin/bash", "-c"]
+
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+
+# ── System dependencies ──────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    build-essential \
+    git \
+    sed \
+    ca-certificates \
+    gnupg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js 22 LTS (required for TypeScript Language Server / tsserver)
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && node --version \
+    && npm --version
+
+# ── Python package manager (uv) ───────────────────────────────────────────────
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+ENV PATH="/root/.local/bin:${PATH}"
+
+# ── R2 snapshot transport (S3 API) ────────────────────────────────────────────
+# Use AWS CLI against the Cloudflare R2 S3-compatible endpoint for startup
+# restore + periodic snapshots of SERENA_HOME. Pin a specific version for
+# reproducible builds.
+RUN python3 -m pip install --no-cache-dir awscli==1.44.44
+
+# ── Install Serena ────────────────────────────────────────────────────────────
+WORKDIR /app/serena
+
+# Copy lockfile, project metadata, and README (hatchling reads readme = "README.md")
+COPY pyproject.toml uv.lock README.md ./
+
+# Copy source tree (includes src/serena/resources/ with the config template)
+# The top-level resources/ dir contains only marketing assets – not needed at runtime
+COPY src/ ./src/
+
+# Create an isolated virtual environment and install production dependencies
+# --frozen: respect uv.lock exactly (reproducible builds)
+# --no-dev:  skip development-only extras
+RUN uv sync --frozen --no-dev
+
+ENV PATH="/app/serena/.venv/bin:${PATH}"
+
+# ── Patch mcp library for Cloudflare compatibility ────────────────────────────
+# FastMCP's streamable-http transport rejects requests with no Accept header
+# (HTTP/406).  Per RFC 7231 §5.3.2, a missing Accept header means the client
+# accepts any media type ("Accept: */*").  Rust clients such as Codex's rmcp
+# omit the Accept header on notifications, which would otherwise break the
+# MCP handshake.  The one-liner below makes an empty Accept permissive.
+RUN python3 - << 'PYEOF'
+import pathlib
+f = pathlib.Path(".venv/lib/python3.11/site-packages/mcp/server/streamable_http.py")
+old = '        accept_header = request.headers.get("accept", "")\n        accept_types = [media_type.strip() for media_type in accept_header.split(",")]'
+new = ('        accept_header = request.headers.get("accept", "")\n'
+       '        # RFC 7231/RFC 9110: missing Accept = accepts anything (*/*)\n'
+       '        if not accept_header.strip():\n'
+       '            return True, True\n'
+       '        accept_types = [media_type.strip().split(";")[0] for media_type in accept_header.split(",") if media_type.strip()]\n'
+       '        if "*/*" in accept_types:\n'
+       '            return True, True\n'
+       '        # Expand common wildcards so standards-compliant clients are accepted.\n'
+       '        if "application/*" in accept_types:\n'
+       '            accept_types.append("application/json")\n'
+       '        if "text/*" in accept_types:\n'
+       '            accept_types.append("text/event-stream")')
+txt = f.read_text()
+assert old in txt, "patch target not found – mcp library may have changed"
+f.write_text(txt.replace(old, new, 1))
+print("patched mcp/server/streamable_http.py OK")
+PYEOF
+
+# ── Serena configuration ──────────────────────────────────────────────────────
+# SERENA_HOME controls where serena_config.yml and user data are stored.
+# Override via the SERENA_HOME environment variable at runtime if needed.
+ENV SERENA_HOME=/app/.serena
+ENV SERENA_DOCKER=1
+ENV SERENA_R2_STATE_ENABLED=0
+ENV SERENA_R2_STATE_PREFIX=serena-mcp/default/serena-home
+ENV SERENA_R2_STATE_PARTITION_MODE=none
+ENV SERENA_R2_STATE_STRICT=0
+ENV SERENA_R2_SNAPSHOT_INTERVAL_SECONDS=180
+ENV SERENA_R2_SNAPSHOT_RETENTION_COUNT=5
+
+# Startup script optionally restores/snapshots SERENA_HOME via the R2 S3 API and
+# then starts Serena with local disk storage.
+COPY cloudflare/bin/start-serena-mcp.sh /usr/local/bin/start-serena-mcp.sh
+RUN chmod +x /usr/local/bin/start-serena-mcp.sh
+
+# ── Runtime ───────────────────────────────────────────────────────────────────
+EXPOSE 8080
+
+# Start the MCP server using the streamable-http transport.
+# The Cloudflare Worker proxies HTTPS → this HTTP endpoint on port 8080.
+#
+# Environment variable overrides at runtime:
+#   SERENA_HOME      – path to serena_config.yml directory
+#   SERENA_LOG_LEVEL – DEBUG | INFO | WARNING | ERROR  (default: INFO)
+ENTRYPOINT ["/usr/local/bin/start-serena-mcp.sh"]
+CMD ["serena-mcp-server", \
+     "--transport", "streamable-http", \
+     "--host", "0.0.0.0", \
+     "--port", "8080", \
+     "--enable-web-dashboard", "False", \
+     "--enable-gui-log-window", "False", \
+     "--open-web-dashboard", "False"]

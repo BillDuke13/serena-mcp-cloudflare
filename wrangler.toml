@@ -1,0 +1,63 @@
+# Cloudflare Workers + Containers configuration for Serena MCP remote deployment
+# Deploy with: pnpm wrangler deploy
+# Set the auth token: pnpm wrangler secret put API_TOKEN
+
+name = "serena-mcp"
+main = "cloudflare/src/index.ts"
+compatibility_date = "2026-01-20"
+compatibility_flags = ["nodejs_compat"]
+
+# ── Container definition ──────────────────────────────────────────────────────
+# Each container instance runs Serena's MCP server (Python + LSP servers).
+# The Worker routes by authenticated token (legacy single-token mode falls back
+# to one singleton route). FastMCP session state remains in-process per route.
+[[containers]]
+class_name      = "SerenaContainer"
+image           = "./Dockerfile.cloudflare"
+max_instances   = 8          # token-routed multi-terminal containers
+
+# ── Durable Objects ───────────────────────────────────────────────────────────
+# Containers are backed by Durable Objects for stateful singleton routing.
+[[durable_objects.bindings]]
+name       = "SERENA_CONTAINER"
+class_name = "SerenaContainer"
+
+[[migrations]]
+tag               = "v1"
+new_sqlite_classes = ["SerenaContainer"]
+
+# ── Non-secret Worker vars ────────────────────────────────────────────────────
+[vars]
+# Route generation used to derive the named singleton container route.
+# Bump this value to force requests onto a fresh container instance after a
+# deploy (useful when an older warm instance is still serving traffic).
+MCP_CONTAINER_ROUTE_GENERATION = "gen-1"
+
+# Optional R2-backed persistence using snapshot sync (not live FUSE writes).
+# The container keeps SERENA_HOME on local disk and periodically uploads a
+# compressed snapshot to R2, plus a best-effort snapshot on shutdown.
+SERENA_R2_STATE_ENABLED = "0"
+# Version the prefix to quarantine incompatible state left by older experiments
+# (for example, when SERENA_HOME was mounted directly on a FUSE object store).
+SERENA_R2_STATE_PREFIX = "serena-mcp/default/serena-home-snapshots-v1"
+SERENA_R2_STATE_PARTITION_MODE = "durable-object"
+SERENA_R2_STATE_STRICT = "0"
+SERENA_R2_SNAPSHOT_INTERVAL_SECONDS = "180"
+SERENA_R2_SNAPSHOT_RETENTION_COUNT = "5"
+
+# Suggested bucket name (best-practice style: app-purpose-env).
+# Create this bucket first, then set your real account ID.
+R2_BUCKET_NAME = "serena-mcp-state-prod"
+R2_ACCOUNT_ID = ""
+
+# ── Secrets (set via CLI, never committed) ────────────────────────────────────
+# Run: pnpm wrangler secret put API_TOKEN
+# The Worker validates every /mcp request against this Bearer token.
+# API_TOKEN is intentionally NOT listed here – use `wrangler secret put`.
+#
+# For optional R2 snapshot persistence (container -> R2 S3 API), also set:
+#   pnpm wrangler secret put AWS_ACCESS_KEY_ID
+#   pnpm wrangler secret put AWS_SECRET_ACCESS_KEY
+#
+# For multi-terminal token routing, optionally set:
+#   pnpm wrangler secret put API_TOKENS_JSON
