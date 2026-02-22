@@ -124,6 +124,173 @@ bootstrap_serena_home() {
     "${target_home}/serena_config.yml"
 }
 
+project_auto_clone_requested() {
+  is_truthy "${PROJECT_AUTO_CLONE:-0}"
+}
+
+project_git_depth() {
+  local raw="${PROJECT_GIT_DEPTH:-1}"
+  if [[ "${raw}" =~ ^[0-9]+$ ]]; then
+    printf '%s' "${raw}"
+    return 0
+  fi
+  printf '1'
+}
+
+project_repo_name_from_url() {
+  local url="$1"
+  local name
+  name="${url##*/}"
+  name="${name%.git}"
+  name="$(printf '%s' "${name}" | tr -c 'A-Za-z0-9._-' '-')"
+  if [[ -z "${name}" ]]; then
+    name="repo"
+  fi
+  printf '%s' "${name}"
+}
+
+project_git_dir() {
+  if [[ -n "${PROJECT_GIT_DIR:-}" ]]; then
+    printf '%s' "${PROJECT_GIT_DIR}"
+    return 0
+  fi
+
+  local route_key repo_name
+  route_key="${CLOUDFLARE_DURABLE_OBJECT_ID:-default}"
+  route_key="$(printf '%s' "${route_key}" | tr -c 'A-Za-z0-9._-' '_')"
+  repo_name="$(project_repo_name_from_url "${PROJECT_GIT_URL:-repo}")"
+  printf '/tmp/serena-workspaces/%s/%s' "${route_key}" "${repo_name}"
+}
+
+require_tmp_workspace_path() {
+  local target="$1"
+  case "${target}" in
+    /tmp/serena-workspaces/*) return 0 ;;
+    *)
+      log "Refusing PROJECT_GIT_DIR outside /tmp/serena-workspaces: ${target}"
+      exit 1
+      ;;
+  esac
+}
+
+ensure_serena_projects_allowlist_entry() {
+  local config_path="$1"
+  local entry="$2"
+  [[ -f "${config_path}" ]] || return 0
+
+  python3 - "${config_path}" "${entry}" << 'PYEOF'
+import pathlib
+import re
+import sys
+
+config_path = pathlib.Path(sys.argv[1])
+entry = sys.argv[2]
+text = config_path.read_text(encoding="utf-8")
+entry_line = f"- {entry}"
+
+# Fast path for exact existing list item.
+if re.search(rf"(?m)^\-\s+{re.escape(entry)}\s*$", text):
+    raise SystemExit(0)
+
+projects_block = re.search(
+    r"(?ms)^projects:\n((?:[ \t]*#.*\n|[ \t]*-.*\n|[ \t]*\n)*)",
+    text,
+)
+
+if projects_block:
+    block = projects_block.group(0)
+    new_block = block + entry_line + "\n"
+    new_text = text[:projects_block.start()] + new_block + text[projects_block.end():]
+else:
+    suffix = "" if text.endswith("\n") else "\n"
+    new_text = f"{text}{suffix}\nprojects:\n{entry_line}\n"
+
+config_path.write_text(new_text, encoding="utf-8")
+PYEOF
+}
+
+sync_project_repo_if_enabled() {
+  if ! project_auto_clone_requested; then
+    return 0
+  fi
+
+  local repo_url repo_ref repo_dir depth
+  repo_url="${PROJECT_GIT_URL:-}"
+  repo_ref="${PROJECT_GIT_REF:-}"
+  repo_dir="$(project_git_dir)"
+  depth="$(project_git_depth)"
+
+  if [[ -z "${repo_url}" ]]; then
+    log "PROJECT_AUTO_CLONE is enabled but PROJECT_GIT_URL is empty"
+    exit 1
+  fi
+
+  require_tmp_workspace_path "${repo_dir}"
+  mkdir -p "$(dirname "${repo_dir}")"
+
+  if [[ -e "${repo_dir}" && ! -d "${repo_dir}" ]]; then
+    log "PROJECT_GIT_DIR exists but is not a directory: ${repo_dir}"
+    exit 1
+  fi
+
+  if [[ -d "${repo_dir}/.git" ]]; then
+    log "Updating project repository in ${repo_dir}"
+    if (( depth > 0 )); then
+      git -C "${repo_dir}" fetch --prune --tags --depth "${depth}" origin
+    else
+      git -C "${repo_dir}" fetch --prune --tags origin
+    fi
+  else
+    if [[ -d "${repo_dir}" ]] && [[ -n "$(ls -A "${repo_dir}" 2>/dev/null || true)" ]]; then
+      log "PROJECT_GIT_DIR is not empty and not a git repository: ${repo_dir}"
+      exit 1
+    fi
+
+    log "Cloning project repository into ${repo_dir}"
+    if (( depth > 0 )); then
+      git clone --depth "${depth}" "${repo_url}" "${repo_dir}"
+    else
+      git clone "${repo_url}" "${repo_dir}"
+    fi
+  fi
+
+  if [[ -n "${repo_ref}" ]]; then
+    log "Checking out configured ref ${repo_ref}"
+    if (( depth > 0 )); then
+      git -C "${repo_dir}" fetch --depth "${depth}" origin "${repo_ref}"
+    else
+      git -C "${repo_dir}" fetch origin "${repo_ref}"
+    fi
+    git -C "${repo_dir}" reset --hard FETCH_HEAD
+  else
+    local default_remote_head default_branch
+    default_remote_head="$(git -C "${repo_dir}" symbolic-ref -q --short refs/remotes/origin/HEAD || true)"
+    if [[ -n "${default_remote_head}" ]]; then
+      default_branch="${default_remote_head#origin/}"
+      git -C "${repo_dir}" reset --hard "origin/${default_branch}"
+    else
+      warn "Unable to resolve origin/HEAD for ${repo_dir}; leaving current checkout as-is"
+    fi
+  fi
+
+  # Ensure each container start begins from a clean Git-first workspace.
+  git -C "${repo_dir}" clean -fdx
+  export SERENA_BOOTSTRAPPED_PROJECT_DIR="${repo_dir}"
+  log "Project workspace ready at ${repo_dir}"
+}
+
+ensure_serena_project_allowlist_if_needed() {
+  local config_path="$1"
+  local project_dir="${SERENA_BOOTSTRAPPED_PROJECT_DIR:-}"
+  if [[ -z "${project_dir}" ]]; then
+    return 0
+  fi
+
+  ensure_serena_projects_allowlist_entry "${config_path}" "/tmp/serena-workspaces"
+  ensure_serena_projects_allowlist_entry "${config_path}" "${project_dir}"
+  log "Updated Serena project allowlist for ${project_dir}"
+}
+
 prepare_r2_snapshot_if_enabled() {
   if ! r2_snapshot_requested; then
     log "R2 snapshot sync disabled; using local SERENA_HOME=${SERENA_HOME:-/app/.serena}"
@@ -361,6 +528,8 @@ main() {
   prepare_r2_snapshot_if_enabled
   restore_serena_home_from_r2 "${SERENA_HOME}"
   bootstrap_serena_home "${SERENA_HOME}"
+  sync_project_repo_if_enabled
+  ensure_serena_project_allowlist_if_needed "${SERENA_HOME}/serena_config.yml"
   start_snapshot_loop
 
   log "Starting Serena MCP server with local SERENA_HOME=${SERENA_HOME}"

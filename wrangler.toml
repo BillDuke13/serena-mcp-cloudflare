@@ -33,6 +33,19 @@ new_sqlite_classes = ["SerenaContainer"]
 # deploy (useful when an older warm instance is still serving traffic).
 MCP_CONTAINER_ROUTE_GENERATION = "gen-1"
 
+# Optional Git-first project bootstrap (disabled by default).
+# When enabled, the container clones/pulls a repo into /tmp and adds the path
+# to Serena's `projects` allowlist so `activate_project("<container-path>")`
+# works remotely.
+PROJECT_AUTO_CLONE = "0"
+PROJECT_GIT_URL = ""
+PROJECT_GIT_REF = ""
+PROJECT_GIT_DEPTH = "1"
+# Leave empty to auto-derive:
+# /tmp/serena-workspaces/<durable-object-id>/<repo-name>
+# If set, it must stay under /tmp/serena-workspaces for safety.
+PROJECT_GIT_DIR = ""
+
 # Optional R2-backed persistence using snapshot sync (not live FUSE writes).
 # The container keeps SERENA_HOME on local disk and periodically uploads a
 # compressed snapshot to R2, plus a best-effort snapshot on shutdown.
